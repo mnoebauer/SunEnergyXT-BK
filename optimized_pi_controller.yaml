@@ -1,0 +1,162 @@
+alias: Optimized PI (2-Mode Grid Zero Controller)
+description: >
+  Two-mode PI controller for grid power balancing.
+  FAST mode for large deviations.
+  SLOW filtered mode near zero.
+  Includes anti-windup, slew-rate limiting, and battery SoC protection.
+
+mode: single
+max_exceeded: silent
+
+trigger:
+  - platform: state
+    entity_id: sensor.shellypro3em_fcb46703bc0c_power
+
+action:
+
+  ############################################################
+  # Read Sensors
+  ############################################################
+
+  - variables:
+      avg_soc: "{{ states(avg_soc_sensor) | float(0) }}"
+      p_grid_raw: "{{ states(grid_sensor) | float(0) }}"
+      limit_a: "{{ states(limit_a_ent) | float(0) }}"
+      limit_b: "{{ states(limit_b_ent) | float(0) }}"
+      real_min_soc: "{{ [limit_a, limit_b] | max }}"
+      curr_timeout_no_io: "{{ states(timeout_no_io) | float(0) }}"
+      curr_timeout_dod: "{{ states(timeout_dod) | float(0) }}"
+
+  ############################################################
+  # Battery Protection
+  ############################################################
+
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ avg_soc <= (real_min_soc + c_buffer_soc) }}"
+        sequence:
+          - service: number.set_value
+            target:
+              entity_id: "{{ inv1_ent }}"
+            data:
+              value: 0
+
+          - service: input_number.set_value
+            target:
+              entity_id: "{{ integral_entity }}"
+            data:
+              value: 0
+
+          - stop: "Low battery protection active"
+
+  ############################################################
+  # Deadband Flag (no stop — integral still updates)
+  ############################################################
+
+  - variables:
+      in_deadband: "{{ p_grid_raw > c_deadband_min and p_grid_raw < c_deadband_max }}"
+
+  ############################################################
+  # Time Step Calculation
+  ############################################################
+
+  - variables:
+      last_ts: >
+        {{ as_timestamp(this.attributes.last_triggered)
+           if this.attributes.last_triggered else 0 }}
+      current_ts: "{{ now().timestamp() }}"
+      raw_diff: >
+        {% if last_ts == 0 %} 999
+        {% else %} {{ current_ts - last_ts }}
+        {% endif %}
+      dt: >
+        {% if raw_diff > c_dt_clamp_threshold %}
+          {{ c_dt_default }}
+        {% else %}
+          {{ raw_diff | round(3) }}
+        {% endif %}
+
+  ############################################################
+  # Mode Selection + Filtering
+  ############################################################
+
+  - variables:
+      use_fast: "{{ (p_grid_raw | abs) > c_fast_err_w }}"
+      alpha: "{{ c_alpha_fast if use_fast else c_alpha_slow }}"
+      prev_filt: "{{ states(grid_filt_entity) | float(p_grid_raw) }}"
+      p_grid_filt: "{{ (alpha * p_grid_raw + (1 - alpha) * prev_filt) | round(2) }}"
+      p_grid: "{{ p_grid_raw if use_fast else p_grid_filt }}"
+      kp_use: "{{ kp_fast if use_fast else kp_slow }}"
+      ki_use: "{{ ki_fast if use_fast else ki_slow }}"
+      max_step: "{{ c_max_step_pct_fast if use_fast else c_max_step_pct_slow }}"
+
+  - service: input_number.set_value
+    target:
+      entity_id: "{{ grid_filt_entity }}"
+    data:
+      value: "{{ p_grid_filt }}"
+
+  ############################################################
+  # PI Controller
+  ############################################################
+
+  - variables:
+      error: "{{ - (p_grid - c_import_bias_w) }}"
+      last_integral: "{{ states(integral_entity) | float(0) }}"
+      last_percent: "{{ states(inv1_ent) | float(0) }}"
+      integ_limit: "{{ p_sum * c_integral_limit_pct }}"
+      current_p: "{{ (last_percent / 100) * p_sum }}"
+
+      p_term: "{{ kp_use * error }}"
+      raw_new_integ: "{{ last_integral + (ki_use * error * dt) }}"
+
+      new_integral_candidate: >
+        {% if raw_new_integ > integ_limit %} {{ integ_limit }}
+        {% elif raw_new_integ < -integ_limit %} {{ -integ_limit }}
+        {% else %} {{ raw_new_integ }}
+        {% endif %}
+
+      new_integral: "{{ new_integral_candidate }}"
+
+      p_offset: "{{ p_term + new_integral }}"
+      raw_target_p: "{{ current_p - p_offset }}"
+
+      target_p: >
+        {% if raw_target_p > p_sum %} {{ p_sum }}
+        {% elif raw_target_p < 0 %} 0
+        {% else %} {{ raw_target_p }}
+        {% endif %}
+
+      new_percent_raw: "{{ (target_p / p_sum * 100) }}"
+      diff_pct: "{{ new_percent_raw - last_percent }}"
+
+      limited_diff_pct: >
+        {% if diff_pct > max_step %} {{ max_step }}
+        {% elif diff_pct < -max_step %} {{ -max_step }}
+        {% else %} {{ diff_pct }}
+        {% endif %}
+
+      new_percent: "{{ (last_percent + limited_diff_pct) | round(2) }}"
+
+  - service: input_number.set_value
+    target:
+      entity_id: "{{ integral_entity }}"
+    data:
+      value: "{{ new_integral | round(3) }}"
+
+  ############################################################
+  # Apply Output (blocked in deadband)
+  ############################################################
+
+  - if:
+      - condition: template
+        value_template: >
+          {{ (not in_deadband)
+             and ((new_percent - last_percent) | abs > c_output_hysteresis) }}
+    then:
+      - service: number.set_value
+        target:
+          entity_id: "{{ inv1_ent }}"
+        data:
+          value: "{{ new_percent }}"
